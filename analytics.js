@@ -1,0 +1,320 @@
+const fs = require('fs');
+const path = require('path');
+
+const DATA_DIR = path.join(__dirname, 'data');
+const RESPONSES_FILE = path.join(DATA_DIR, 'responses.json');
+const QUESTIONS_FILE = path.join(DATA_DIR, 'questions.json');
+const CLASS_FILE = path.join(DATA_DIR, 'classdata.json');
+
+function readJSON(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf-8'));
+}
+
+function getQuestionInfo() {
+  const q = readJSON(QUESTIONS_FILE);
+  const dimensions = q.dimensions.map((d) => ({
+    kode: d.kode,
+    judul: d.judul,
+    indices: d.items.map((it) => it.no - 1)
+  }));
+  const itemNumbers = q.dimensions.flatMap((d) => d.items.map((it) => it.no));
+  return {
+    dimensions,
+    jumlahItem: new Set(itemNumbers).size
+  };
+}
+
+/**
+ * Kriteria persentase berdasarkan tabel sistem penilaian yang digunakan pengguna:
+ * 20,00-36,00  = Tidak Baik
+ * 36,01-52,00  = Kurang Baik
+ * 52,01-68,00  = Cukup Baik
+ * 68,01-84,00  = Baik
+ * 84,01-100,00 = Baik Sekali
+ *
+ * Karena hasil hitung dapat memiliki >2 angka desimal, batas diperlakukan kontinu:
+ * <=36; <=52; <=68; <=84; >84. Tampilan kemudian dibulatkan 2 desimal.
+ */
+function kriteriaPersentase(persentase) {
+  if (!Number.isFinite(persentase)) return { kode: 'belumAdaData', label: 'Belum Ada Data' };
+  if (persentase <= 36) return { kode: 'tidakBaik', label: 'Tidak Baik' };
+  if (persentase <= 52) return { kode: 'kurangBaik', label: 'Kurang Baik' };
+  if (persentase <= 68) return { kode: 'cukupBaik', label: 'Cukup Baik' };
+  if (persentase <= 84) return { kode: 'baik', label: 'Baik' };
+  return { kode: 'baikSekali', label: 'Baik Sekali' };
+}
+
+/**
+ * Skor netral berbasis batas bawah interval kepercayaan (Wilson score untuk
+ * rating bintang, metode Evan Miller — "How Not To Sort By Average Rating").
+ * Berbeda dari skor tertimbang (yang hanya mempertimbangkan JUMLAH responden),
+ * metode ini mempertimbangkan seluruh SEBARAN nilai (1-5) yang diterima dosen,
+ * termasuk konsistensinya. Tidak ada parameter arbitrer (seperti "m") yang
+ * perlu dipilih manual — z adalah tingkat keyakinan statistik standar.
+ */
+function wilsonStarScore(counts, z = 1.65) {
+  const K = counts.length;
+  const N = counts.reduce((a, b) => a + b, 0);
+  if (N === 0) return 0;
+  let mean = 0;
+  for (let k = 0; k < K; k++) {
+    const s = k + 1;
+    mean += s * ((counts[k] + 1) / (N + K));
+  }
+  let variance = 0;
+  for (let k = 0; k < K; k++) {
+    const s = k + 1;
+    const p = (counts[k] + 1) / (N + K);
+    variance += p * Math.pow(s - mean, 2);
+  }
+  const se = Math.sqrt(variance / (N + K + 1));
+  return mean - z * se;
+}
+
+// Kategori lama (skala 1-5) dipertahankan agar fitur lama tetap kompatibel.
+function bucketOf(rata) {
+  if (rata >= 4.5) return 'sangatBaik';
+  if (rata >= 3.5) return 'baik';
+  if (rata >= 2.5) return 'cukup';
+  return 'perluPerhatian';
+}
+
+/**
+ * Bangun ringkasan lengkap: per-dosen, sistem persentase Skor Aktual/Skor Ideal,
+ * analitik lama, distribusi, serta ringkasan institusi.
+ */
+function buildAnalytics() {
+  const responses = fs.existsSync(RESPONSES_FILE) ? readJSON(RESPONSES_FILE) : [];
+  const questionInfo = getQuestionInfo();
+  const dims = questionInfo.dimensions;
+  const jumlahItem = questionInfo.jumlahItem;
+  const classData = readJSON(CLASS_FILE);
+  const prodiByKode = {};
+  classData.forEach((c) => { prodiByKode[c.kode] = c.prodi; });
+
+  const perDosen = {};
+
+  for (const r of responses) {
+    for (const p of r.penilaian) {
+      if (!perDosen[p.dosen]) {
+        perDosen[p.dosen] = {
+          dosen: p.dosen,
+          kelasSet: new Set(),
+          prodiSet: new Set(),
+          jumlahResponden: 0,
+          totalPerItem: new Array(jumlahItem).fill(0),
+          distribusi: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+          saranList: []
+        };
+      }
+      const s = perDosen[p.dosen];
+      s.jumlahResponden += 1;
+      s.kelasSet.add(r.kelas);
+      s.prodiSet.add(r.prodi || prodiByKode[r.kelas] || '');
+      p.jawaban.forEach((v, idx) => {
+        if (idx < s.totalPerItem.length) s.totalPerItem[idx] += v;
+        s.distribusi[v] = (s.distribusi[v] || 0) + 1;
+      });
+      if (p.saran && p.saran.trim()) {
+        s.saranList.push({ kelas: r.kelas, waktu: r.waktu, teks: p.saran.trim() });
+      }
+    }
+  }
+
+  const dosenResult = Object.values(perDosen).map((s) => {
+    const rataPerItem = s.totalPerItem.map((t) => +(t / s.jumlahResponden).toFixed(2));
+    const rataPerDimensi = {};
+    dims.forEach((d) => {
+      const vals = d.indices.map((i) => rataPerItem[i]).filter((v) => Number.isFinite(v));
+      rataPerDimensi[d.kode] = {
+        judul: d.judul,
+        rata: vals.length ? +(vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(2) : 0
+      };
+    });
+
+    const skorAktual = s.totalPerItem.reduce((a, b) => a + b, 0);
+    const skorIdeal = s.jumlahResponden * jumlahItem * 5;
+    const persentaseSkorRaw = skorIdeal ? (skorAktual / skorIdeal) * 100 : 0;
+    const persentaseSkor = +persentaseSkorRaw.toFixed(2);
+    const kriteria = kriteriaPersentase(persentaseSkorRaw);
+
+    const rataKeseluruhanRaw = skorIdeal
+      ? skorAktual / (s.jumlahResponden * jumlahItem)
+      : 0;
+    const rataKeseluruhan = +rataKeseluruhanRaw.toFixed(2);
+
+    return {
+      dosen: s.dosen,
+      kelas: Array.from(s.kelasSet).join(', '),
+      prodi: Array.from(s.prodiSet).filter(Boolean).join(', '),
+      jumlahResponden: s.jumlahResponden,
+      jumlahItem,
+      skorAktual,
+      skorIdeal,
+      persentaseSkor,
+      persentaseSkorRaw,
+      kriteriaPersentase: kriteria.label,
+      kriteriaPersentaseKode: kriteria.kode,
+      rataPerItem,
+      rataPerDimensi,
+      rataKeseluruhan,
+      rataKeseluruhanRaw,
+      distribusi: s.distribusi,
+      kategori: bucketOf(rataKeseluruhan),
+      saranList: s.saranList
+    };
+  }).sort((a, b) => b.persentaseSkorRaw - a.persentaseSkorRaw);
+
+  // ---- Skor tertimbang lama (dipertahankan sebagai analitik tambahan) ----
+  const totalDosenAwal = dosenResult.length;
+  const semuaRata = dosenResult.map((d) => d.rataKeseluruhanRaw);
+  const semuaN = dosenResult.map((d) => d.jumlahResponden).sort((a, b) => a - b);
+  const C = totalDosenAwal
+    ? semuaRata.reduce((a, b) => a + b, 0) / totalDosenAwal
+    : 0;
+  const mid = Math.floor(semuaN.length / 2);
+  const m = semuaN.length
+    ? (semuaN.length % 2 ? semuaN[mid] : (semuaN[mid - 1] + semuaN[mid]) / 2)
+    : 0;
+
+  const WILSON_Z = 1.65;
+  dosenResult.forEach((d) => {
+    const v = d.jumlahResponden;
+    d.skorTertimbangRaw = m
+      ? ((v / (v + m)) * d.rataKeseluruhanRaw) + ((m / (v + m)) * C)
+      : d.rataKeseluruhanRaw;
+    d.skorTertimbang = +d.skorTertimbangRaw.toFixed(2);
+    // Penanda data terbatas mengikuti ambang tetap dashboard: < 10 responden.
+    d.dataTerbatas = v < 10;
+
+    const counts = [1, 2, 3, 4, 5].map((val) => d.distribusi[val] || 0);
+    d.skorNetralRaw = wilsonStarScore(counts, WILSON_Z);
+    d.skorNetral = +d.skorNetralRaw.toFixed(3);
+  });
+
+  // Sistem persentase menjadi urutan default dari backend.
+  dosenResult.sort((a, b) => b.persentaseSkorRaw - a.persentaseSkorRaw);
+
+  // ---- Ringkasan tingkat institusi ----
+  const totalPenilaian = dosenResult.reduce((a, d) => a + d.jumlahResponden, 0);
+  const totalSubmission = responses.length;
+  const totalDosen = dosenResult.length;
+
+  const rataInstitusi = totalDosen
+    ? +(dosenResult.reduce((a, d) => a + d.rataKeseluruhan, 0) / totalDosen).toFixed(2)
+    : 0;
+
+  const skorAktualInstitusi = dosenResult.reduce((a, d) => a + d.skorAktual, 0);
+  const skorIdealInstitusi = dosenResult.reduce((a, d) => a + d.skorIdeal, 0);
+  const persentaseSkorInstitusiRaw = skorIdealInstitusi
+    ? (skorAktualInstitusi / skorIdealInstitusi) * 100
+    : 0;
+  const persentaseSkorInstitusi = +persentaseSkorInstitusiRaw.toFixed(2);
+  const kriteriaInstitusi = skorIdealInstitusi
+    ? kriteriaPersentase(persentaseSkorInstitusiRaw)
+    : { kode: 'belumAdaData', label: 'Belum Ada Data' };
+
+  const rataPerDimensiInstitusi = {};
+  dims.forEach((d) => {
+    const vals = dosenResult.map((x) => x.rataPerDimensi[d.kode].rata);
+    rataPerDimensiInstitusi[d.kode] = {
+      judul: d.judul,
+      rata: vals.length ? +(vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(2) : 0
+    };
+  });
+
+  const distribusiKepuasan = { sangatBaik: 0, baik: 0, cukup: 0, perluPerhatian: 0 };
+  dosenResult.forEach((d) => { distribusiKepuasan[d.kategori] += 1; });
+
+  const distribusiKriteriaPersentase = {
+    tidakBaik: 0,
+    kurangBaik: 0,
+    cukupBaik: 0,
+    baik: 0,
+    baikSekali: 0
+  };
+  dosenResult.forEach((d) => {
+    if (Object.prototype.hasOwnProperty.call(distribusiKriteriaPersentase, d.kriteriaPersentaseKode)) {
+      distribusiKriteriaPersentase[d.kriteriaPersentaseKode] += 1;
+    }
+  });
+
+  const distribusiNilaiInstitusi = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  dosenResult.forEach((d) => {
+    for (let v = 1; v <= 5; v++) distribusiNilaiInstitusi[v] += d.distribusi[v] || 0;
+  });
+
+  const perKelasMap = {};
+  responses.forEach((r) => {
+    if (!perKelasMap[r.kelas]) {
+      perKelasMap[r.kelas] = { kelas: r.kelas, prodi: r.prodi, jumlahResponden: 0, totalSkor: 0, totalItem: 0 };
+    }
+    const k = perKelasMap[r.kelas];
+    k.jumlahResponden += 1;
+    r.penilaian.forEach((p) => {
+      p.jawaban.forEach((v) => { k.totalSkor += v; k.totalItem += 1; });
+    });
+  });
+  const perKelas = Object.values(perKelasMap).map((k) => {
+    const skorIdeal = k.totalItem * 5;
+    const persentaseRaw = skorIdeal ? (k.totalSkor / skorIdeal) * 100 : 0;
+    const kriteria = kriteriaPersentase(persentaseRaw);
+    return {
+      kelas: k.kelas,
+      prodi: k.prodi,
+      jumlahResponden: k.jumlahResponden,
+      rataRata: k.totalItem ? +(k.totalSkor / k.totalItem).toFixed(2) : 0,
+      skorAktual: k.totalSkor,
+      skorIdeal,
+      persentaseSkor: +persentaseRaw.toFixed(2),
+      kriteriaPersentase: kriteria.label
+    };
+  }).sort((a, b) => a.kelas.localeCompare(b.kelas));
+
+  return {
+    overview: {
+      totalSubmission,
+      totalPenilaian,
+      totalDosen,
+      jumlahItem,
+      skalaMaksimum: 5,
+      rataInstitusi,
+      skorAktualInstitusi,
+      skorIdealInstitusi,
+      persentaseSkorInstitusi,
+      persentaseSkorInstitusiRaw,
+      kriteriaPersentaseInstitusi: kriteriaInstitusi.label,
+      kriteriaPersentaseInstitusiKode: kriteriaInstitusi.kode,
+      rataPerDimensiInstitusi,
+      distribusiKepuasan,
+      distribusiKriteriaPersentase,
+      distribusiNilaiInstitusi,
+      perKelas,
+      skorTertimbangInfo: { m, c: C },
+      skorNetralInfo: { z: WILSON_Z },
+      sistemPersentaseInfo: {
+        rumus: 'Persentase Skor = (Skor Aktual / Skor Ideal) × 100%',
+        skorAktual: 'Jumlah seluruh nilai jawaban yang diterima',
+        skorIdeal: `Jumlah responden × ${jumlahItem} item × 5`,
+        kriteria: [
+          { min: 20, max: 36, label: 'Tidak Baik' },
+          { min: 36.01, max: 52, label: 'Kurang Baik' },
+          { min: 52.01, max: 68, label: 'Cukup Baik' },
+          { min: 68.01, max: 84, label: 'Baik' },
+          { min: 84.01, max: 100, label: 'Baik Sekali' }
+        ]
+      }
+    },
+    dosen: dosenResult,
+    dimensiInfo: dims.map((d) => ({ kode: d.kode, judul: d.judul }))
+  };
+}
+
+module.exports = {
+  buildAnalytics,
+  kriteriaPersentase,
+  readJSON,
+  RESPONSES_FILE,
+  QUESTIONS_FILE,
+  CLASS_FILE
+};

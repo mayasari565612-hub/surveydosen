@@ -1,0 +1,8 @@
+node_modules/
+npm-debug.log*
+.env
+.DS_Store
+*.log
+
+# Data hasil survei lokal - jangan dipublikasikan ke repository
+data/responses.json
