@@ -242,7 +242,7 @@
             <option value="persentaseSkor">Urutkan: Persentase Skor (Aktual ÷ Ideal)</option>
             <option value="skorTertimbang">Urutkan: Skor Tertimbang (IMDB-style)</option>
             <option value="skorNetral">Urutkan: Skor Netral (Wilson)</option>
-            <option value="ambangMinimum">Urutkan: Filter Ambang Minimum (≥10 responden)</option>
+            <option value="ambangMinimum">Urutkan: Kelompok Responden (≥19 / 10–18 / &lt;10)</option>
             <option value="rataKeseluruhan">Urutkan: Rata-rata Mentah</option>
           </select>
           <button class="btn btn-ghost" id="btnExportXlsx">⬇ Unduh Excel (.xlsx)</button>
@@ -449,7 +449,7 @@ const RANK_METRIC_LABEL = {
   skorNetral: 'Skor Netral (Wilson)',
   skorTertimbang: 'Skor Tertimbang (IMDB-style)',
   rataKeseluruhan: 'Rata-rata Mentah',
-  ambangMinimum: 'Filter Ambang Minimum'
+  ambangMinimum: 'Kelompok Responden (≥19 / 10–18 / <10)'
 };
 const RANK_METRIC_RAW_FIELD = {
   persentaseSkor: 'persentaseSkorRaw',
@@ -457,24 +457,29 @@ const RANK_METRIC_RAW_FIELD = {
   skorTertimbang: 'skorTertimbangRaw',
   rataKeseluruhan: 'rataKeseluruhanRaw'
 };
-const AMBANG_MINIMUM_N = 10; // responden < 10 selalu dipisahkan ke bagian bawah
+const TARGET_RESPONDEN_N = 19; // kelompok utama: minimal 19 responden
+const AMBANG_MINIMUM_N = 10; // kelompok data terbatas: kurang dari 10 responden
 function sortByRankMetric(list) {
-  // Apa pun metode ranking yang dipilih, dosen dengan responden < 10
-  // tidak dicampur dengan kelompok utama. Mereka tetap ditampilkan,
-  // tetapi selalu ditempatkan setelah divider "data belum representatif".
+  // Semua metode ranking memakai tiga kelompok responden yang terpisah:
+  // 1) >=19 responden = kelompok utama
+  // 2) 10-18 responden = dipisahkan karena belum mencapai target 19
+  // 3) <10 responden = data terbatas, dipisahkan lagi di bagian paling bawah
   const rawField = CURRENT_RANK_METRIC === 'ambangMinimum'
     ? 'rataKeseluruhanRaw'
     : (RANK_METRIC_RAW_FIELD[CURRENT_RANK_METRIC] || CURRENT_RANK_METRIC);
 
   const sortDesc = (a, b) => Number(b[rawField] || 0) - Number(a[rawField] || 0);
-  const atas = list
-    .filter((d) => d.jumlahResponden >= AMBANG_MINIMUM_N)
+  const utama = list
+    .filter((d) => d.jumlahResponden >= TARGET_RESPONDEN_N)
     .sort(sortDesc);
-  const bawah = list
+  const bawah19 = list
+    .filter((d) => d.jumlahResponden >= AMBANG_MINIMUM_N && d.jumlahResponden < TARGET_RESPONDEN_N)
+    .sort(sortDesc);
+  const bawah10 = list
     .filter((d) => d.jumlahResponden < AMBANG_MINIMUM_N)
     .sort(sortDesc);
 
-  return { atas, bawah };
+  return { utama, bawah19, bawah10 };
 }
 const charts = {};
 const NAVY = '#16294a', GOLD = '#b8912f', OK='#3a7d5c', WARN='#9a3030', MID='#9a7415', BLUE='#2f5583';
@@ -786,11 +791,11 @@ function renderAll() {
   const info = ANALYTICS.overview.skorTertimbangInfo;
   const infoNetral = ANALYTICS.overview.skorNetralInfo;
   const metricNote = {
-    persentaseSkor: `Diurutkan berdasarkan <b>Persentase Skor</b> — % Skor = (Skor Aktual ÷ Skor Ideal) × 100%. Dosen dengan <b>&lt; ${AMBANG_MINIMUM_N} responden</b> selalu dipisahkan ke bagian bawah dan tidak dicampur dengan ranking utama. Kriteria: ≤36 Tidak Baik; >36–52 Kurang Baik; >52–68 Cukup Baik; >68–84 Baik; >84–100 Baik Sekali.`,
+    persentaseSkor: `Diurutkan berdasarkan <b>Persentase Skor</b> — % Skor = (Skor Aktual ÷ Skor Ideal) × 100%. Tabel dibagi menjadi tiga kelompok: <b>≥ ${TARGET_RESPONDEN_N} responden</b> sebagai kelompok utama, <b>${AMBANG_MINIMUM_N}–${TARGET_RESPONDEN_N - 1} responden</b> sebagai kelompok belum mencapai 19, dan <b>&lt; ${AMBANG_MINIMUM_N} responden</b> sebagai data terbatas. Kriteria: ≤36 Tidak Baik; >36–52 Kurang Baik; >52–68 Cukup Baik; >68–84 Baik; >84–100 Baik Sekali.`,
     skorNetral: `Diurutkan berdasarkan <b>Skor Netral</b> — batas bawah keyakinan statistik dari sebaran nilai 1-5 (z=${infoNetral ? infoNetral.z : 1.65}), mempertimbangkan jumlah dan konsistensi nilai, bukan hanya jumlah responden.`,
     skorTertimbang: `Diurutkan berdasarkan <b>Skor Tertimbang</b> — dosen dengan sedikit responden ditarik mendekati rata-rata institusi (ambang normal ≈ ${info ? info.m : '-'} responden, rata-rata institusi ${info ? info.c.toFixed(2) : '-'}).`,
     rataKeseluruhan: `Diurutkan berdasarkan <b>Rata-rata Mentah</b> — tanpa penyesuaian apapun, dosen dengan sedikit responden bisa unggul hanya karena kebetulan.`,
-    ambangMinimum: `Diurutkan berdasarkan <b>Filter Ambang Minimum</b> — hanya dosen dengan &ge; ${AMBANG_MINIMUM_N} responden yang masuk ranking utama, diurutkan pakai rata-rata mentah (tanpa formula apapun). Dosen di bawah ${AMBANG_MINIMUM_N} responden dipisah ke bawah sebagai "data belum representatif", tidak ikut bersaing.`
+    ambangMinimum: `Diurutkan berdasarkan <b>Kelompok Responden</b>. Dosen dengan &ge; ${TARGET_RESPONDEN_N} responden berada di kelompok utama. Dosen dengan ${AMBANG_MINIMUM_N}–${TARGET_RESPONDEN_N - 1} responden dipisahkan pada bagian "di bawah 19", sedangkan dosen dengan &lt; ${AMBANG_MINIMUM_N} responden dipisahkan lagi pada bagian "di bawah 10". Di dalam setiap kelompok, urutan memakai rata-rata mentah.`
   };
   document.getElementById('skorInfoText').innerHTML =
     ` <span class="muted">${metricNote[CURRENT_RANK_METRIC] || ''}</span>`;
@@ -861,8 +866,8 @@ function metricChartConfig() {
 
 function renderChartDosen(dosenList) {
   destroyChart('dosen');
-  const { atas, bawah } = sortByRankMetric(dosenList);
-  const sorted = [...atas, ...bawah];
+  const { utama, bawah19, bawah10 } = sortByRankMetric(dosenList);
+  const sorted = [...utama, ...bawah19, ...bawah10];
   const cfg = metricChartConfig();
   document.getElementById('chartDosenTitle').textContent = cfg.title;
   document.getElementById('chartDosenSub').textContent = cfg.sub;
@@ -958,13 +963,20 @@ function renderChartKelas() {
 }
 
 function renderTable(dosenList) {
-  const { atas, bawah } = sortByRankMetric(dosenList);
-  const rowHtml = (d) => `
+  const { utama, bawah19, bawah10 } = sortByRankMetric(dosenList);
+  const rowHtml = (d) => {
+    let status = '';
+    if (d.jumlahResponden < AMBANG_MINIMUM_N) {
+      status = ' <span class="muted" title="Jumlah responden kurang dari 10; masuk kelompok data terbatas">(data terbatas)</span>';
+    } else if (d.jumlahResponden < TARGET_RESPONDEN_N) {
+      status = ' <span class="muted" title="Jumlah responden belum mencapai target 19">(belum 19)</span>';
+    }
+    return `
     <tr class="clickable" data-dosen="${encodeURIComponent(d.dosen)}">
       <td>${escapeHtml(d.dosen)}</td>
       <td>${escapeHtml(d.prodi)}</td>
       <td>${escapeHtml(d.kelas)}</td>
-      <td>${d.jumlahResponden}${d.jumlahResponden < AMBANG_MINIMUM_N ? ' <span class="muted" title="Jumlah responden kurang dari 10; dipisahkan dari ranking utama">(data terbatas)</span>' : ''}</td>
+      <td>${d.jumlahResponden}${status}</td>
       <td>${Number(d.skorAktual || 0).toLocaleString('id-ID')}</td>
       <td>${Number(d.skorIdeal || 0).toLocaleString('id-ID')}</td>
       <td class="score" ${CURRENT_RANK_METRIC==='persentaseSkor' ? 'style="font-weight:700"' : ''}>${Number(d.persentaseSkor || 0).toFixed(2)}%</td>
@@ -972,16 +984,28 @@ function renderTable(dosenList) {
       <td class="score" ${CURRENT_RANK_METRIC==='rataKeseluruhan' || CURRENT_RANK_METRIC==='ambangMinimum' ? 'style="font-weight:700"' : ''}>${d.rataKeseluruhan}</td>
       <td class="score" ${CURRENT_RANK_METRIC==='skorTertimbang' ? 'style="font-weight:700"' : ''}>${d.skorTertimbang}</td>
       <td class="score" ${CURRENT_RANK_METRIC==='skorNetral' ? 'style="font-weight:700"' : ''} title="Skor netral: batas bawah keyakinan statistik dari sebaran nilai">${d.skorNetral}</td>
-    </tr>
-  `;
-  const dividerHtml = bawah.length ? `
+    </tr>`;
+  };
+
+  const divider19 = bawah19.length ? `
     <tr>
       <td colspan="11" style="background:#f4efe4; color:#9a7415; font-weight:700; text-align:center; padding:10px;">
-        &darr; Di bawah ambang minimum (${AMBANG_MINIMUM_N} responden) — data belum representatif, tidak ikut dirangking &darr;
+        &darr; Responden di bawah ${TARGET_RESPONDEN_N} (${AMBANG_MINIMUM_N}–${TARGET_RESPONDEN_N - 1} responden) — belum mencapai target 19 &darr;
       </td>
     </tr>` : '';
+
+  const divider10 = bawah10.length ? `
+    <tr>
+      <td colspan="11" style="background:#f8e9e9; color:#9a3030; font-weight:700; text-align:center; padding:10px;">
+        &darr; Responden di bawah ${AMBANG_MINIMUM_N} (&lt;${AMBANG_MINIMUM_N} responden) — data terbatas / belum representatif &darr;
+      </td>
+    </tr>` : '';
+
   document.getElementById('tableDosenBody').innerHTML =
-    atas.map(rowHtml).join('') + dividerHtml + bawah.map(rowHtml).join('');
+    utama.map(rowHtml).join('') +
+    divider19 + bawah19.map(rowHtml).join('') +
+    divider10 + bawah10.map(rowHtml).join('');
+
   document.querySelectorAll('#tableDosenBody tr').forEach(tr => {
     if (!tr.hasAttribute('data-dosen')) return;
     tr.onclick = () => openDetail(decodeURIComponent(tr.getAttribute('data-dosen')));
