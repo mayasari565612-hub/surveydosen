@@ -1,4 +1,5 @@
 const ExcelJS = require('exceljs');
+const zlib = require('zlib');
 
 const NAVY = 'FF16294A';
 const GOLD = 'FFB8912F';
@@ -112,6 +113,301 @@ function rankMap(items, scoreFn) {
   const map = new Map();
   sorted.forEach((item, idx) => map.set(item.dosen, idx + 1));
   return { sorted, map };
+}
+
+
+function hexToRgb(hex) {
+  const clean = String(hex).replace(/^#/, '').replace(/^FF/i, '');
+  const s = clean.length === 6 ? clean : clean.slice(-6);
+  return [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16)];
+}
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const typeBuf = Buffer.from(type, 'ascii');
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crcBuf]);
+}
+
+function makePng(width, height, paint) {
+  const rgba = Buffer.alloc(width * height * 4, 255);
+  const setPixel = (x, y, color) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    const i = (y * width + x) * 4;
+    rgba[i] = color[0]; rgba[i + 1] = color[1]; rgba[i + 2] = color[2]; rgba[i + 3] = color.length > 3 ? color[3] : 255;
+  };
+  const fillRect = (x0, y0, w, h, color) => {
+    const x1 = Math.min(width, Math.max(0, x0 + w));
+    const y1 = Math.min(height, Math.max(0, y0 + h));
+    for (let y = Math.max(0, y0); y < y1; y++) {
+      for (let x = Math.max(0, x0); x < x1; x++) setPixel(x, y, color);
+    }
+  };
+  paint({ setPixel, fillRect, width, height });
+
+  const scan = Buffer.alloc((width * 4 + 1) * height);
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * (width * 4 + 1);
+    scan[rowStart] = 0;
+    rgba.copy(scan, rowStart + 1, y * width * 4, (y + 1) * width * 4);
+  }
+
+  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // RGBA
+  ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  return Buffer.concat([
+    sig,
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(scan, { level: 9 })),
+    pngChunk('IEND', Buffer.alloc(0))
+  ]);
+}
+
+function createPieChartPng(values, colors, width = 480, height = 280) {
+  const vals = values.map((v) => Math.max(0, Number(v) || 0));
+  const total = vals.reduce((a, b) => a + b, 0) || 1;
+  const cumulative = [];
+  let acc = 0;
+  vals.forEach((v) => { acc += v / total; cumulative.push(acc); });
+  const rgbs = colors.map(hexToRgb);
+
+  return makePng(width, height, ({ setPixel, fillRect }) => {
+    fillRect(0, 0, width, height, [255, 255, 255, 255]);
+    const cx = Math.round(width / 2);
+    const cy = Math.round(height / 2);
+    const radius = Math.floor(Math.min(width, height) * 0.39);
+    const inner = Math.floor(radius * 0.45);
+    for (let y = cy - radius; y <= cy + radius; y++) {
+      for (let x = cx - radius; x <= cx + radius; x++) {
+        const dx = x - cx, dy = y - cy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > radius * radius || d2 < inner * inner) continue;
+        let angle = Math.atan2(dy, dx) + Math.PI / 2;
+        if (angle < 0) angle += Math.PI * 2;
+        const t = angle / (Math.PI * 2);
+        let idx = cumulative.findIndex((c) => t <= c);
+        if (idx < 0) idx = cumulative.length - 1;
+        setPixel(x, y, rgbs[idx] || [95, 127, 168]);
+      }
+    }
+    // center hole / soft ring
+    for (let y = cy - inner; y <= cy + inner; y++) {
+      for (let x = cx - inner; x <= cx + inner; x++) {
+        const dx = x - cx, dy = y - cy;
+        if (dx * dx + dy * dy <= inner * inner) setPixel(x, y, [248, 250, 252, 255]);
+      }
+    }
+  });
+}
+
+function createBarChartPng(values, colors, width = 560, height = 260, maxValue = null) {
+  const vals = values.map((v) => Math.max(0, Number(v) || 0));
+  const maxV = Math.max(1, maxValue || Math.max(...vals, 1));
+  const rgbs = colors.map(hexToRgb);
+  return makePng(width, height, ({ fillRect }) => {
+    fillRect(0, 0, width, height, [255, 255, 255, 255]);
+    const left = 34, right = 18, top = 18, bottom = 28;
+    const plotW = width - left - right;
+    const plotH = height - top - bottom;
+    for (let i = 0; i <= 5; i++) {
+      const y = top + Math.round((plotH * i) / 5);
+      fillRect(left, y, plotW, 1, [226, 232, 240, 255]);
+    }
+    const slot = plotW / Math.max(1, vals.length);
+    const barW = Math.max(8, Math.floor(slot * 0.58));
+    vals.forEach((v, idx) => {
+      const h = Math.round((v / maxV) * (plotH - 4));
+      const x = Math.round(left + idx * slot + (slot - barW) / 2);
+      const y = top + plotH - h;
+      fillRect(x, y, barW, h, rgbs[idx % rgbs.length] || [95, 127, 168]);
+    });
+    fillRect(left, top + plotH, plotW, 2, [148, 163, 184, 255]);
+  });
+}
+
+function addLegend(ws, startRow, startCol, items, total = null) {
+  const denom = total == null ? items.reduce((a, x) => a + x.value, 0) : total;
+  items.forEach((item, idx) => {
+    const row = startRow + idx;
+    const swatch = ws.getCell(row, startCol);
+    swatch.value = '';
+    swatch.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: item.argb } };
+    setThinBorder(swatch);
+    const label = ws.getCell(row, startCol + 1);
+    label.value = item.label;
+    const val = ws.getCell(row, startCol + 2);
+    val.value = item.value;
+    val.font = { bold: true, color: { argb: NAVY } };
+    const pct = ws.getCell(row, startCol + 3);
+    pct.value = denom > 0 ? item.value / denom : 0;
+    pct.numFmt = '0.0%';
+    [label, val, pct].forEach((c) => setThinBorder(c));
+  });
+}
+
+function addOverallSheet(wb, analytics) {
+  const ws = wb.addWorksheet('Keseluruhan', {
+    views: [{ showGridLines: false }],
+    pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 }
+  });
+  ws.properties.tabColor = { argb: MID_GREEN };
+  const widths = [5, 24, 13, 13, 13, 13, 13, 13, 3, 5, 24, 13, 13, 13, 13, 13, 13, 13, 13, 13];
+  widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+  ws.mergeCells('A1:T2');
+  ws.getCell('A1').value = 'VISUAL KESELURUHAN HASIL SURVEI DOSEN';
+  ws.getCell('A1').font = { bold: true, size: 20, color: { argb: 'FFFFFFFF' } };
+  ws.getCell('A1').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
+  ws.getCell('A1').alignment = { vertical: 'middle', horizontal: 'center' };
+  ws.getRow(1).height = 28; ws.getRow(2).height = 16;
+  ws.mergeCells('A3:T3');
+  ws.getCell('A3').value = 'Ringkasan visual institusi • pie chart, distribusi nilai, dimensi, dan basis jumlah responden';
+  ws.getCell('A3').alignment = { horizontal: 'center' };
+  ws.getCell('A3').font = { italic: true, color: { argb: MUTED } };
+
+  const ov = analytics.overview;
+  kpiCard(ws, 'A5:D8', 'TOTAL PENGISIAN', ov.totalSubmission, { fill: LIGHT_NAVY });
+  kpiCard(ws, 'E5:H8', 'TOTAL DOSEN', ov.totalDosen, { fill: LIGHT_GOLD });
+  kpiCard(ws, 'J5:M8', 'PERSENTASE INSTITUSI', `${ov.persentaseSkorInstitusi.toFixed(2)}%`, { fill: LIGHT_GREEN });
+  kpiCard(ws, 'N5:Q8', 'RATA-RATA', `${ov.rataInstitusi.toFixed(2)} / 5`, { fill: LIGHT_NAVY });
+  kpiCard(ws, 'R5:T8', 'TOTAL PENILAIAN', ov.totalPenilaian, { fill: LIGHT_GOLD });
+
+  const utama = analytics.dosen.filter((d) => d.jumlahResponden >= 19);
+  const menengah = analytics.dosen.filter((d) => d.jumlahResponden >= 10 && d.jumlahResponden < 19);
+  const rendah = analytics.dosen.filter((d) => d.jumlahResponden < 10);
+
+  const respondentGroups = [
+    { label: '≥19 responden', value: utama.length, argb: MID_GREEN },
+    { label: '10–18 responden', value: menengah.length, argb: MID_GOLD },
+    { label: '<10 responden', value: rendah.length, argb: MID_RED }
+  ];
+
+  styleSection(ws, 'A10:I10', 'PIE — KOMPOSISI BASIS JUMLAH RESPONDEN');
+  const pie1 = wb.addImage({
+    buffer: createPieChartPng(respondentGroups.map((x) => x.value), respondentGroups.map((x) => x.argb), 470, 280),
+    extension: 'png'
+  });
+  ws.addImage(pie1, { tl: { col: 0.35, row: 10.25 }, ext: { width: 390, height: 235 } });
+  ws.getCell('F12').value = 'Kelompok'; ws.getCell('G12').value = 'Dosen'; ws.getCell('H12').value = '%';
+  ['F12','G12','H12'].forEach((a) => {
+    const c = ws.getCell(a); c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } }; c.alignment = { horizontal: 'center' };
+  });
+  addLegend(ws, 13, 5, respondentGroups);
+
+  const criterionLabels = {
+    tidakBaik: 'Tidak Baik', kurangBaik: 'Kurang Baik', cukupBaik: 'Cukup Baik', baik: 'Baik', baikSekali: 'Baik Sekali'
+  };
+  const criterionColors = ['FFB96C6C', 'FFE19B72', 'FFC5A24A', 'FF5F7FA8', 'FF5B9A72'];
+  const criteria = Object.entries(ov.distribusiKriteriaPersentase).map(([k, v], i) => ({
+    label: criterionLabels[k] || k, value: v, argb: criterionColors[i] || MID_BLUE
+  }));
+  styleSection(ws, 'J10:T10', 'PIE — DISTRIBUSI KRITERIA PERSENTASE');
+  const pie2 = wb.addImage({
+    buffer: createPieChartPng(criteria.map((x) => x.value), criteria.map((x) => x.argb), 470, 280), extension: 'png'
+  });
+  ws.addImage(pie2, { tl: { col: 9.35, row: 10.25 }, ext: { width: 390, height: 235 } });
+  ws.getCell('O12').value = 'Kriteria'; ws.getCell('P12').value = 'Dosen'; ws.getCell('Q12').value = '%';
+  ['O12','P12','Q12'].forEach((a) => {
+    const c = ws.getCell(a); c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } }; c.alignment = { horizontal: 'center' };
+  });
+  addLegend(ws, 13, 14, criteria);
+
+  const dist = [1,2,3,4,5].map((v) => ({ label: `Nilai ${v}`, value: ov.distribusiNilaiInstitusi[v] || 0, argb: ['FFB96C6C','FFE19B72','FFC5A24A','FF5F7FA8','FF5B9A72'][v-1] }));
+  styleSection(ws, 'A27:I27', 'BAR — DISTRIBUSI SELURUH NILAI 1–5');
+  const bar1 = wb.addImage({ buffer: createBarChartPng(dist.map(x => x.value), dist.map(x => x.argb), 570, 260), extension: 'png' });
+  ws.addImage(bar1, { tl: { col: 0.35, row: 27.4 }, ext: { width: 430, height: 205 } });
+  ws.getCell('F29').value = 'Nilai'; ws.getCell('G29').value = 'Jumlah'; ws.getCell('H29').value = '%';
+  ['F29','G29','H29'].forEach((a) => {
+    const c = ws.getCell(a); c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } }; c.alignment = { horizontal: 'center' };
+  });
+  addLegend(ws, 30, 5, dist);
+
+  const dims = Object.values(ov.rataPerDimensiInstitusi).map((d, i) => ({
+    label: d.judul, value: d.rata, argb: ['FF5F7FA8','FF5B9A72','FFC5A24A','FF7C6FA6','FF4E9AA0'][i % 5]
+  }));
+  styleSection(ws, 'J27:T27', 'BAR — RATA-RATA PER DIMENSI');
+  const bar2 = wb.addImage({ buffer: createBarChartPng(dims.map(x => x.value), dims.map(x => x.argb), 570, 260, 5), extension: 'png' });
+  ws.addImage(bar2, { tl: { col: 9.35, row: 27.4 }, ext: { width: 430, height: 205 } });
+  ws.getCell('O29').value = 'Dimensi'; ws.getCell('P29').value = 'Rata-rata'; ws.getCell('Q29').value = '% dari 5';
+  ['O29','P29','Q29'].forEach((a) => {
+    const c = ws.getCell(a); c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } }; c.alignment = { horizontal: 'center' };
+  });
+  dims.forEach((item, idx) => {
+    const row = 30 + idx;
+    ws.getCell(row, 14).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: item.argb } };
+    setThinBorder(ws.getCell(row, 14));
+    ws.getCell(row, 15).value = item.label;
+    ws.getCell(row, 16).value = item.value;
+    ws.getCell(row, 17).value = item.value / 5;
+    ws.getCell(row, 17).numFmt = '0.0%';
+    [15,16,17].forEach(c => setThinBorder(ws.getCell(row, c)));
+  });
+
+  styleSection(ws, 'A45:T45', 'RINGKASAN TOP 5 MENURUT BERBAGAI MODEL — HANYA DOSEN ≥19 RESPONDEN');
+  const pool = utama;
+  const modelDefs = [
+    { title: 'Persentase Skor', fn: d => d.persentaseSkorRaw, display: d => `${d.persentaseSkor.toFixed(2)}%` },
+    { title: 'Rata-rata 1–5', fn: d => d.rataKeseluruhanRaw, display: d => d.rataKeseluruhan.toFixed(2) },
+    { title: 'Skor Tertimbang', fn: d => d.skorTertimbangRaw, display: d => d.skorTertimbang.toFixed(2) },
+    { title: 'Skor Netral', fn: d => d.skorNetralRaw, display: d => d.skorNetral.toFixed(3) }
+  ];
+  const blockStarts = [1, 6, 11, 16];
+  modelDefs.forEach((m, bi) => {
+    const c1 = blockStarts[bi], c2 = bi === 3 ? 20 : c1 + 4;
+    ws.mergeCells(46, c1, 46, c2);
+    const hc = ws.getCell(46, c1);
+    hc.value = m.title;
+    hc.font = { bold: true, color: { argb: NAVY } };
+    hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT_GOLD } };
+    hc.alignment = { horizontal: 'center' };
+    [...pool].sort((a,b) => m.fn(b) - m.fn(a)).slice(0,5).forEach((d, idx) => {
+      const row = 47 + idx;
+      ws.mergeCells(row, c1, row, c2 - 1);
+      ws.getCell(row, c1).value = `${idx + 1}. ${d.dosen}`;
+      ws.getCell(row, c1).alignment = { wrapText: true, vertical: 'middle' };
+      ws.getCell(row, c2).value = m.display(d);
+      ws.getCell(row, c2).font = { bold: true, color: { argb: NAVY } };
+      ws.getCell(row, c2).alignment = { horizontal: 'center' };
+      for (let c = c1; c <= c2; c++) setThinBorder(ws.getCell(row, c));
+    });
+  });
+
+  ws.mergeCells('A54:T57');
+  ws.getCell('A54').value =
+    'Keterangan: pie chart dan bar chart pada sheet ini dibuat otomatis saat Excel diekspor, tanpa mengubah data mentah. ' +
+    'Pemisahan responden mengikuti aturan dashboard: ≥19 sebagai kelompok utama, 10–18 sebagai kelompok menengah, dan <10 sebagai kelompok data terbatas. ' +
+    'Perbandingan model hanya dilakukan pada kelompok ≥19 agar basis jumlah responden lebih seragam.';
+  ws.getCell('A54').alignment = { wrapText: true, vertical: 'top' };
+  ws.getCell('A54').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: CREAM } };
+  ws.getCell('A54').font = { color: { argb: 'FF334155' } };
+  for (let r = 54; r <= 57; r++) for (let c = 1; c <= 20; c++) setThinBorder(ws.getCell(r,c));
+  return ws;
 }
 
 function addDashboard(wb, analytics) {
@@ -358,7 +654,10 @@ async function buildWorkbook(analytics, questions, responses) {
   // ================= SHEET 1: Dashboard =================
   addDashboard(wb, analytics);
 
-  // ================= SHEET 2: Ringkasan Institusi =================
+  // ================= SHEET 2: Keseluruhan Visual =================
+  addOverallSheet(wb, analytics);
+
+  // ================= SHEET 3: Ringkasan Institusi =================
   const wsOverview = wb.addWorksheet('Ringkasan Institusi', {
     views: [{ state: 'frozen', ySplit: 1 }]
   });
@@ -452,7 +751,7 @@ async function buildWorkbook(analytics, questions, responses) {
     { width: 16 }, { width: 16 }, { width: 18 }, { width: 18 }
   ];
 
-  // ================= SHEET 3: Ringkasan Per Dosen =================
+  // ================= SHEET 4: Ringkasan Per Dosen =================
   const wsDosen = wb.addWorksheet('Ringkasan Per Dosen', {
     views: [{ state: 'frozen', ySplit: 1 }]
   });
@@ -512,7 +811,7 @@ async function buildWorkbook(analytics, questions, responses) {
   wsDosen.getColumn(4 + dimKodes.length + 3).numFmt = '0.00%';
   wsDosen.autoFilter = { from: 'A1', to: `${String.fromCharCode(64 + header.length)}1` };
 
-  // ================= SHEET 4: Detail Per Item Pertanyaan =================
+  // ================= SHEET 5: Detail Per Item Pertanyaan =================
   const wsItem = wb.addWorksheet('Detail Per Item', {
     views: [{ state: 'frozen', ySplit: 1 }]
   });
@@ -544,7 +843,7 @@ async function buildWorkbook(analytics, questions, responses) {
     });
   });
 
-  // ================= SHEET 5: Distribusi Nilai (1-5) =================
+  // ================= SHEET 6: Distribusi Nilai (1-5) =================
   const wsDist = wb.addWorksheet('Distribusi Nilai');
   const distHeader = wsDist.addRow(['Nama Dosen', '1 (Tidak Baik)', '2', '3', '4', '5 (Sangat Baik)', 'Total Jawaban']);
   styleHeaderRow(distHeader);
@@ -555,7 +854,7 @@ async function buildWorkbook(analytics, questions, responses) {
   });
   wsDist.columns = [{ width: 32 }, { width: 15 }, { width: 10 }, { width: 10 }, { width: 10 }, { width: 15 }, { width: 14 }];
 
-  // ================= SHEET 6: Saran & Kritik =================
+  // ================= SHEET 7: Saran & Kritik =================
   const wsSaran = wb.addWorksheet('Saran & Kritik');
   const saranHeader = wsSaran.addRow(['Nama Dosen', 'Kelas', 'Waktu', 'Saran / Kritik Mahasiswa']);
   styleHeaderRow(saranHeader);
@@ -567,7 +866,7 @@ async function buildWorkbook(analytics, questions, responses) {
   wsSaran.columns = [{ width: 32 }, { width: 14 }, { width: 20 }, { width: 70 }];
   wsSaran.getColumn(4).alignment = { wrapText: true, vertical: 'top' };
 
-  // ================= SHEET 7: Data Mentah =================
+  // ================= SHEET 8: Data Mentah =================
   const wsRaw = wb.addWorksheet('Data Mentah', { views: [{ state: 'frozen', ySplit: 1 }] });
   const rawHeader = ['Waktu', 'Program Studi', 'Kelas', 'Nama Dosen',
     ...Array.from({ length: 19 }, (_, i) => `Q${i + 1}`), 'Saran / Kritik'];
